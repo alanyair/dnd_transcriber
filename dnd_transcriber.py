@@ -1,45 +1,4 @@
-"""
-╔══════════════════════════════════════════════════════════════╗
-║          DnD Session Transcriber — Craig + Whisper           ║
-║  Convierte las pistas de Craig en una transcripción unificada ║
-╚══════════════════════════════════════════════════════════════╝
 
-INSTALACIÓN DE DEPENDENCIAS:
-    pip install openai-whisper tqdm
-
-    También necesitas ffmpeg instalado en tu sistema:
-    - Windows: https://ffmpeg.org/download.html  (o: winget install ffmpeg)
-    - Mac:     brew install ffmpeg
-    - Linux:   sudo apt install ffmpeg
-
-    NOTA: pydub NO es necesario (no funciona en Python 3.13+).
-    La detección de silencio se hace directamente con ffmpeg.
-
-CÓMO USAR CRAIG:
-    1. Invita a Craig a tu servidor de Discord: https://craig.chat
-    2. Escribe !join en el canal de voz para iniciar la grabación
-    3. Al terminar la sesión escribe !stop
-    4. Craig te enviará un link de descarga con un .zip
-    5. El .zip contiene archivos como:
-         1-DungeonMaster.flac
-         2-Arthas.flac
-         3-Gandalf.flac
-         ...
-    6. Extrae el .zip en una carpeta y pásale la ruta a este script
-
-USO BÁSICO:
-    python dnd_transcriber.py --input ./sesion_dnd --output sesion_01.txt
-
-USO CON NOMBRE DE SESIÓN:
-    python dnd_transcriber.py --input ./sesion_dnd --output sesion_01.txt --titulo "Campaña Ravenloft - Sesión 1"
-
-CAMBIAR MODELO DE WHISPER (más grande = más preciso pero más lento):
-    python dnd_transcriber.py --input ./sesion_dnd --output sesion_01.txt --modelo medium
-    Modelos disponibles: tiny, base, small, medium, large (default: small)
-
-CAMBIAR IDIOMA (por defecto detecta automático, pero forzar español mejora precisión):
-    python dnd_transcriber.py --input ./sesion_dnd --output sesion_01.txt --idioma es
-"""
 
 import os
 import re
@@ -144,6 +103,69 @@ def audio_tiene_voz(audio_path: Path, umbral_db: float = 50.0) -> bool:
         return True  # Si ffmpeg falla, no saltamos la pista
 
 
+# ── Limpieza de ruido ─────────────────────────────────────────────────────────
+
+def limpiar_ruido_pista(audio_path: Path) -> Path:
+    """
+    Aplica reducción de ruido estacionario a una pista de audio.
+    Usa los primeros 2 segundos como muestra del ruido de fondo (antes de que
+    el jugador empiece a hablar) y lo elimina del resto del audio.
+
+    Requiere: pip install noisereduce soundfile numpy
+
+    Retorna la ruta del audio limpio (archivo temporal .wav).
+    Si las dependencias no están o falla, retorna la ruta original sin cambios.
+    """
+    try:
+        import noisereduce as nr
+        import soundfile as sf
+        import numpy as np
+    except ImportError:
+        print("   ⚠️  noisereduce/soundfile no instalados — transcribiendo sin limpiar.")
+        print("      Instálalos con: pip install noisereduce soundfile numpy")
+        return audio_path
+
+    try:
+        print(f"   🔉 Limpiando ruido de fondo...")
+
+        # Leer el audio con soundfile (soporta .flac, .ogg, .wav, .mp3 vía ffmpeg)
+        audio, sr = sf.read(str(audio_path), always_2d=False)
+
+        # Si es estéreo, convertir a mono promediando canales
+        if audio.ndim == 2:
+            audio = audio.mean(axis=1)
+
+        # Usar los primeros 2 segundos como perfil de ruido
+        # (normalmente es el silencio/ruido antes de que el jugador hable)
+        muestra_ruido = audio[:sr * 60]
+
+        # Reducción de ruido estacionario
+        # stationary=True  → ideal para ruidos constantes (ventilador, hum eléctrico)
+        # prop_decrease     → qué tanto reducir el ruido (0.0 = nada, 1.0 = todo)
+        audio_limpio = nr.reduce_noise(
+            y=audio,
+            sr=sr,
+            y_noise=muestra_ruido,
+            prop_decrease=0.90,
+            stationary=True,
+            n_jobs=-1,          # usar todos los núcleos disponibles
+        )
+
+        # Guardar en un archivo temporal .wav (Whisper lo acepta bien)
+        tmp = tempfile.NamedTemporaryFile(
+            suffix="_limpio.wav",
+            prefix=audio_path.stem + "_",
+            delete=False,
+        )
+        sf.write(tmp.name, audio_limpio, sr)
+        print(f"   ✓  Audio limpio guardado temporalmente")
+        return Path(tmp.name)
+
+    except Exception as e:
+        print(f"   ⚠️  Error al limpiar ruido: {e} — usando audio original")
+        return audio_path
+
+
 # ── Transcripción ─────────────────────────────────────────────────────────────
 
 def transcribir_pista(
@@ -225,8 +247,8 @@ def limpiar_alucinaciones(segmentos: list[dict]) -> list[dict]:
         # Puntuación y tokens especiales de Whisper
         "...", "…", ".", ",", "-", "_",
         # Frases genéricas que Whisper inventa en silencio
-        "gracias", "gracias.", "ok", "ok.", "sí", "sí.", "no", "no.",
-        "hmm", "mmm", "eh", "ah", "uh",
+        #"gracias", "gracias.", "ok", "ok.", "sí", "sí.", "no", "no.",
+        #"hmm", "mmm", "eh", "ah", "uh",
         # Tokens internos que Whisper a veces filtra mal
         "[música]", "[music]", "[silencio]", "[ruido]",
         "(música)", "(music)",
@@ -354,12 +376,13 @@ def procesar_sesion(
     titulo: str = "Transcripción de Sesión DnD",
     guardar_json_flag: bool = True,
     mostrar_timestamps: bool = True,
+    pistas_a_limpiar: list[str] | None = None,
 ) -> None:
     """
     Pipeline completo:
     1. Busca los archivos de Craig en la carpeta indicada (o extrae un .zip)
     2. Carga el modelo Whisper
-    3. Transcribe cada pista por separado
+    3. Transcribe cada pista por separado (aplicando limpieza de ruido si se indica)
     4. Mezcla y ordena cronológicamente
     5. Genera el archivo de texto final
     """
@@ -423,11 +446,26 @@ def procesar_sesion(
 
     pistas_transcritas = []
 
+    # Normalizar la lista de pistas a limpiar (minúsculas para comparar sin importar mayúsculas)
+    limpiar_set = {n.lower() for n in (pistas_a_limpiar or [])}
+    if limpiar_set:
+        print(f"🔉 Pistas con reducción de ruido activada: {', '.join(pistas_a_limpiar)}\n")
+
+    archivos_temporales = []  # para borrarlos al final
+
     for audio_path in tqdm(pistas_activas, desc="Transcribiendo pistas", total=len(pistas_activas)):
         jugador = extraer_nombre_jugador(audio_path.name)
         print(f"\n🎙️  Transcribiendo: {jugador}...")
 
-        segmentos = transcribir_pista(modelo, audio_path, idioma)
+        # Aplicar limpieza de ruido si este jugador está en la lista
+        ruta_a_transcribir = audio_path
+        if jugador.lower() in limpiar_set:
+            ruta_limpia = limpiar_ruido_pista(audio_path)
+            if ruta_limpia != audio_path:
+                archivos_temporales.append(ruta_limpia)
+                ruta_a_transcribir = ruta_limpia
+
+        segmentos = transcribir_pista(modelo, ruta_a_transcribir, idioma)
 
         if not segmentos:
             print(f"   ⚠️  Sin segmentos reconocidos para {jugador}")
@@ -452,6 +490,8 @@ def procesar_sesion(
     print("🧹 Limpiando alucinaciones y ruido de fondo...")
     segmentos_limpios = limpiar_alucinaciones(segmentos_mezclados)
 
+
+
     # ── 6. Generar y guardar el resultado ─────────────────────────────────────
 
     transcripcion = formatear_transcripcion(
@@ -466,6 +506,13 @@ def procesar_sesion(
 
     if guardar_json_flag:
         guardar_json(segmentos_limpios, ruta_salida)
+
+    # Limpiar archivos temporales de audio procesado
+    for tmp in archivos_temporales:
+        try:
+            tmp.unlink()
+        except Exception:
+            pass
 
     # Vista previa de las primeras líneas
     print("\n── Vista previa ──────────────────────────────────────")
@@ -526,6 +573,14 @@ Ejemplos:
         "--sin-timestamps", action="store_true",
         help="Omitir los timestamps [HH:MM:SS] en la transcripción"
     )
+    parser.add_argument(
+        "--limpiar-pistas", nargs="+", metavar="JUGADOR", default=None,
+        help=(
+            "Nombres de jugadores cuya pista recibirá reducción de ruido antes de "
+            "transcribir. Ej: --limpiar-pistas darknesswolf88 otrojugador\n"
+            "Requiere: pip install noisereduce soundfile numpy"
+        )
+    )
 
     args = parser.parse_args()
 
@@ -539,6 +594,7 @@ Ejemplos:
         titulo              = args.titulo,
         guardar_json_flag   = not args.sin_json,
         mostrar_timestamps  = not args.sin_timestamps,
+        pistas_a_limpiar    = args.limpiar_pistas,
     )
 
 
