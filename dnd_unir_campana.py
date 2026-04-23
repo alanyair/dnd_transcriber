@@ -1,32 +1,3 @@
-"""
-╔══════════════════════════════════════════════════════════════╗
-║          DnD Campaign Timeline — Línea de tiempo continua    ║
-║  Une varios JSON de sesiones en UNA sola línea de tiempo.    ║
-║  El segundo JSON empieza donde termina el primero.           ║
-╚══════════════════════════════════════════════════════════════╝
-
-CÓMO FUNCIONA:
-    Toma los JSON en el orden que los pases (o alfabético si usas --carpeta).
-    Calcula la duración de cada sesión y suma ese offset al siguiente.
-
-    sesion_01.json  →  00:00:00 … 02:30:00
-    sesion_02.json  →  02:30:00 … 05:10:00
-    sesion_03.json  →  05:10:00 … 07:45:00
-
-    El resultado es un único TXT sin separadores ni encabezados,
-    como si toda la campaña fuera una sola grabación.
-
-USO:
-    # Archivos en orden cronológico
-    python dnd_unir_campana.py --input sesion_01.json sesion_02.json sesion_03.json --output campana.txt
-
-    # Carpeta completa (orden alfabético por nombre de archivo)
-    python dnd_unir_campana.py --carpeta ./sesiones/ --output campana.txt
-
-    # Con título y omitiendo jugador ruidoso
-    python dnd_unir_campana.py --carpeta ./sesiones/ --output campana.txt \\
-        --titulo "Campaña Ravenloft" --omitir darknesswolf88
-"""
 
 import json
 import sys
